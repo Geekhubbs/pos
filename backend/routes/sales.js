@@ -1,6 +1,88 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const axios = require('axios');
+
+// Verify Paystack Payment
+router.post('/verify-paystack', async (req, res) => {
+    const { reference } = req.body;
+    if (!reference) return res.status(400).json({ message: 'Reference is required' });
+
+    try {
+        const response = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
+            headers: {
+                Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
+            }
+        });
+
+        if (response.data.data.status === 'success') {
+            res.json({ success: true, data: response.data.data });
+        } else {
+            res.json({ success: false, status: response.data.data.status, message: 'Payment status: ' + response.data.data.status });
+        }
+    } catch (error) {
+        console.error('Paystack verification error:', error.response?.data || error.message);
+        res.status(500).json({ success: false, message: 'Verification failed' });
+    }
+});
+
+// Charge Mobile Money directly (Server-to-Server)
+router.post('/charge-momo', async (req, res) => {
+    const { amount, phone, provider, email } = req.body;
+    if (!amount || !phone || !provider || !email) {
+        return res.status(400).json({ message: 'Amount, phone, provider, and email are required' });
+    }
+
+    try {
+        const payload = {
+            email: email,
+            amount: amount, // defined in pesewas already
+            mobile_money: {
+                phone: phone,
+                provider: provider
+            }
+        };
+
+        const response = await axios.post(`https://api.paystack.co/charge`, payload, {
+            headers: {
+                Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        // Paystack usually returns a 'pending' or 'send_otp' status for MoMo while prompt is sent to user
+        res.json({ success: true, data: response.data.data });
+    } catch (error) {
+        console.error('Paystack charge error:', error.response?.data || error.message);
+        res.status(500).json({ 
+            success: false, 
+            message: error.response?.data?.message || 'Charge failed' 
+        });
+    }
+});
+
+// Submit Paystack OTP
+router.post('/submit-otp', async (req, res) => {
+    const { otp, reference } = req.body;
+    try {
+        const response = await axios.post(`https://api.paystack.co/charge/submit_otp`, {
+            otp,
+            reference
+        }, {
+            headers: {
+                Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        res.json({ success: true, data: response.data.data });
+    } catch (error) {
+        console.error('Paystack submit OTP error:', error.response?.data || error.message);
+        res.status(500).json({ 
+            success: false, 
+            message: error.response?.data?.message || 'Failed to submit OTP' 
+        });
+    }
+});
 
 // Create a new sale
 router.post('/', (req, res) => {

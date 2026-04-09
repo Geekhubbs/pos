@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import axios from "axios";
 import "./Sales.css";
@@ -43,6 +43,13 @@ function Sales() {
   const [paymentMethod, setPaymentMethod] = useState("Cash");
   const [amountPaid, setAmountPaid] = useState("");
   const [checkoutError, setCheckoutError] = useState("");
+  const [momoPhone, setMomoPhone] = useState("");
+  const [momoProvider, setMomoProvider] = useState("mtn");
+  const [isPolling, setIsPolling] = useState(false);
+  const [isOtpRequired, setIsOtpRequired] = useState(false);
+  const [momoOtp, setMomoOtp] = useState("");
+  const [momoReference, setMomoReference] = useState("");
+  const pollIntervalRef = useRef(null);
 
   useEffect(() => {
     loadProducts();
@@ -174,11 +181,7 @@ function Sales() {
     setCheckoutModal(true);
   }
 
-  async function processPayment() {
-    if (paymentMethod === "Cash" && parseFloat(amountPaid || 0) < grandTotal) {
-      setCheckoutError("Amount tendered is less than the total.");
-      return;
-    }
+  async function saveSaleToDB(method, paid) {
     try {
       const user_id = JSON.parse(atob(token.split(".")[1])).user_id;
       const res = await axios.post(
@@ -191,8 +194,8 @@ function Sales() {
             quantity: i.quantity,
             price: parseFloat(i.price),
           })),
-          payment_method: paymentMethod,
-          amount_paid: parseFloat(amountPaid || grandTotal),
+          payment_method: method,
+          amount_paid: parseFloat(paid),
         },
         { headers },
       );
@@ -204,14 +207,137 @@ function Sales() {
         tax,
         subtotal,
         discount: parseFloat(discount || 0),
-        paymentMethod,
-        amountPaid: parseFloat(amountPaid || grandTotal),
-        change: Math.max(0, change),
+        paymentMethod: method,
+        amountPaid: parseFloat(paid),
+        change: Math.max(0, method === "Cash" ? parseFloat(paid) - grandTotal : 0),
       });
       setCheckoutModal(false);
       setReceiptModal(true);
     } catch (err) {
-      setCheckoutError("Payment failed. Please try again.");
+      setCheckoutError("Database save failed.");
+    }
+  }
+
+  async function pollVerification(reference) {
+    setIsPolling(true);
+    setCheckoutError("");
+    pollIntervalRef.current = setInterval(async () => {
+      try {
+        const verifyRes = await axios.post(`${API}/sales/verify-paystack`, { reference }, { headers });
+        if (verifyRes.data.success) {
+          clearInterval(pollIntervalRef.current);
+          setIsPolling(false);
+          saveSaleToDB("Mobile Money", grandTotal);
+        } else if (verifyRes.data.status && !['pending', 'ongoing', 'processing', 'send_pin', 'send_otp', 'pay_offline'].includes(verifyRes.data.status)) {
+          clearInterval(pollIntervalRef.current);
+          setIsPolling(false);
+          setCheckoutError(`Payment failed or cancelled: ${verifyRes.data.status}`);
+        }
+      } catch (err) {
+        // Continue polling until timeout if there are temporary network errors
+      }
+    }, 5000);
+
+    setTimeout(() => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        setIsPolling(false);
+        setCheckoutError("Payment timed out. Please try again.");
+      }
+    }, 120000); // 2 minutes
+  }
+
+  async function processPayment() {
+    if (paymentMethod === "Cash") {
+      if (parseFloat(amountPaid || 0) < grandTotal) {
+        setCheckoutError("Amount tendered is less than the total.");
+        return;
+      }
+      saveSaleToDB("Cash", amountPaid || grandTotal);
+    } else if (paymentMethod === "Mobile Money") {
+      setCheckoutError("");
+      if (!momoPhone || momoPhone.length < 9) {
+        setCheckoutError("Please enter a valid phone number.");
+        return;
+      }
+      setIsPolling(true);
+      try {
+        const paystackAmount = Math.round(grandTotal * 100);
+        const res = await axios.post(`${API}/sales/charge-momo`, {
+            amount: paystackAmount,
+            phone: momoPhone,
+            provider: momoProvider,
+            email: `guest_${Date.now()}@paystack-pos.com`
+        }, { headers });
+        
+        if (res.data.success && res.data.data.reference) {
+             if (res.data.data.status === 'send_otp' || res.data.data.status === 'send_pin') {
+                 setIsPolling(false);
+                 setMomoReference(res.data.data.reference);
+                 setIsOtpRequired(true);
+             } else {
+                 pollVerification(res.data.data.reference);
+             }
+        } else {
+             setIsPolling(false);
+             setCheckoutError("Could not initiate MoMo charge.");
+        }
+      } catch(err) {
+        setIsPolling(false);
+        setCheckoutError(err.response?.data?.message || "Error initiating MoMo charge.");
+      }
+    }
+  }
+
+  async function submitOtp() {
+    if (!momoOtp) return setCheckoutError("Please enter the OTP or Voucher Code.");
+    setIsPolling(true);
+    setCheckoutError("");
+    try {
+      const res = await axios.post(`${API}/sales/submit-otp`, {
+        otp: momoOtp,
+        reference: momoReference
+      }, { headers });
+      
+      if (res.data.success) {
+        setIsOtpRequired(false);
+        pollVerification(momoReference);
+      } else {
+        setIsPolling(false);
+        setCheckoutError("Failed to submit OTP.");
+      }
+    } catch (err) {
+      setIsPolling(false);
+      setCheckoutError(err.response?.data?.message || "Error submitting OTP.");
+    }
+  }
+
+  function cancelPayment() {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    setIsPolling(false);
+    setIsOtpRequired(false);
+    setCheckoutError("Payment cancelled by cashier.");
+  }
+
+  function handlePhoneChange(e) {
+    const num = e.target.value.replace(/\D/g, ""); // Allow only digits
+    setMomoPhone(num);
+    setCheckoutError("");
+
+    if (num.length >= 3) {
+      const prefix = num.substring(0, 3);
+      if (['024', '054', '055', '059', '025', '053'].includes(prefix)) {
+        setMomoProvider('mtn');
+      } else if (['020', '050'].includes(prefix)) {
+        setMomoProvider('vod');
+      } else if (['027', '057', '026', '056'].includes(prefix)) {
+        setMomoProvider('tgo');
+      } else if (num.length >= 4) {
+        setCheckoutError("Unrecognized network prefix. The number might be invalid.");
+      }
     }
   }
 
@@ -483,14 +609,20 @@ function Sales() {
       {checkoutModal && (
         <div
           className="s-modal-overlay"
-          onClick={() => setCheckoutModal(false)}
+          onClick={() => {
+            if (isPolling) cancelPayment();
+            setCheckoutModal(false);
+          }}
         >
           <div className="s-modal" onClick={(e) => e.stopPropagation()}>
             <div className="s-modal-header">
               <h3>Complete Payment</h3>
               <button
                 className="s-modal-close"
-                onClick={() => setCheckoutModal(false)}
+                onClick={() => {
+                  if (isPolling) cancelPayment();
+                  setCheckoutModal(false);
+                }}
               >
                 &times;
               </button>
@@ -502,7 +634,7 @@ function Sales() {
               <div className="s-form-group">
                 <label>Payment Method</label>
                 <div className="payment-methods">
-                  {["Cash", "Mobile Money", "Card"].map((m) => (
+                  {["Cash", "Mobile Money"].map((m) => (
                     <button
                       key={m}
                       className={`payment-btn ${paymentMethod === m ? "active" : ""}`}
@@ -510,6 +642,8 @@ function Sales() {
                         setPaymentMethod(m);
                         setAmountPaid("");
                         setCheckoutError("");
+                        setIsOtpRequired(false);
+                        setMomoOtp("");
                       }}
                     >
                       {m}
@@ -535,18 +669,79 @@ function Sales() {
                   )}
                 </div>
               )}
+              {paymentMethod === "Mobile Money" && !isOtpRequired && (
+                <div className="s-form-group">
+                  <label>Mobile Number</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. 0541234567"
+                    value={momoPhone}
+                    onChange={handlePhoneChange}
+                    disabled={isPolling}
+                  />
+                  <label style={{ marginTop: '10px', display: 'block' }}>Network Provider</label>
+                  <select 
+                    value={momoProvider} 
+                    onChange={(e) => setMomoProvider(e.target.value)} 
+                    disabled={isPolling}
+                    className="discount-input"
+                    style={{ width: '100%', padding: '8px', marginBottom: '10px' }}
+                  >
+                    <option value="mtn">MTN</option>
+                    <option value="vod">Telecel/Vodafone</option>
+                    <option value="tgo">AirtelTigo</option>
+                  </select>
+                </div>
+              )}
+              {paymentMethod === "Mobile Money" && isOtpRequired && (
+                <div className="s-form-group">
+                  <label>Enter OTP / Voucher Code</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. 123456"
+                    value={momoOtp}
+                    onChange={(e) => setMomoOtp(e.target.value)}
+                    disabled={isPolling}
+                  />
+                  <button 
+                    className="s-btn s-btn-success" 
+                    onClick={submitOtp}
+                    disabled={isPolling}
+                    style={{ marginTop: '10px', width: '100%' }}
+                  >
+                    {isPolling ? "Verifying..." : "Submit Code"}
+                  </button>
+                </div>
+              )}
               {checkoutError && <div className="s-error">{checkoutError}</div>}
+              {isPolling && (
+                <div style={{ textAlign: "center", color: "#0ea5e9", margin: "10px 0", fontWeight: "bold" }}>
+                  ⏳ Waiting for customer to enter PIN...
+                </div>
+              )}
             </div>
             <div className="s-modal-footer">
               <button
                 className="s-btn s-btn-outline"
-                onClick={() => setCheckoutModal(false)}
+                onClick={() => {
+                  if (isPolling) {
+                    cancelPayment();
+                  } else {
+                    setCheckoutModal(false);
+                  }
+                }}
               >
                 Cancel
               </button>
-              <button className="s-btn s-btn-success" onClick={processPayment}>
-                Confirm Payment
-              </button>
+              {!isOtpRequired && (
+                <button 
+                  className="s-btn s-btn-success" 
+                  onClick={processPayment}
+                  disabled={isPolling}
+                >
+                  {isPolling ? "Processing..." : "Confirm Payment"}
+                </button>
+              )}
             </div>
           </div>
         </div>
